@@ -64,8 +64,6 @@ broker = IbkrStubAdapter()
 if FRONTEND_DIR.exists():
     app.mount("/frontend", StaticFiles(directory=str(FRONTEND_DIR)), name="frontend")
 
-app.include_router(analytics_router)
-app.include_router(status_router)
 
 @app.on_event("startup")
 def startup() -> None:
