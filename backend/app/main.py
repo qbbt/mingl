@@ -26,6 +26,8 @@ from .execution import IbkrStubAdapter
 from .indicators import INDICATOR_REGISTRY
 from .leaderboard import DEFAULT_PROFILE, RankingProfile, compute_score
 from .notifications import process_email_outbox, queue_email_notification
+from .routers.analytics import router as analytics_router
+from .routers.status import router as status_router
 from .schemas import (
     AnnotationCreate,
     CorrelationPairResult,

@@ -91,3 +91,40 @@ def test_orders_notifications_and_demo_seed() -> None:
     process = client.post("/notifications/outbox/process?limit=5")
     assert process.status_code == 200
     assert "attempted" in process.json()
+
+
+def test_analytics_and_status_routes() -> None:
+    seed = client.post("/demo/meal-trade-flow")
+    assert seed.status_code == 200
+    payload = seed.json()
+    meal_id = payload["meal_entity_id"]
+    trade_id = payload["trade_entity_id"]
+
+    status = client.get("/status")
+    assert status.status_code == 200
+    assert status.json()["version"] == "v1.5-optimizer"
+
+    wave = client.get(f"/analytics/wave/{meal_id}?metric_name=calories")
+    assert wave.status_code == 200
+    assert "series" in wave.json()
+
+    lag = client.get(
+        f"/analytics/lag_sweep?entity_a_id={meal_id}&entity_b_id={trade_id}&metric_a=calories&metric_b=trade_count&max_lag_days=7"
+    )
+    assert lag.status_code == 200
+    assert "best_lag" in lag.json()
+
+    matrix = client.get(f"/analytics/correlations/matrix?entity_ids={meal_id},{trade_id}&metric_name=calories")
+    assert matrix.status_code == 200
+    assert matrix.json()["heatmap_ready"] is True
+
+    media = client.post(
+        "/analytics/media/sync",
+        json={
+            "media_url": "https://example.local/test.mp3",
+            "current_audio_sec": 12.5,
+            "entities": ["MEAL-CALORIES", "TRADES-AFTER-MEAL"],
+        },
+    )
+    assert media.status_code == 200
+    assert media.json()["status"] == "ready_for_mp3_overlay"

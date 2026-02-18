@@ -110,3 +110,15 @@ class IndicatorResult(BaseModel):
     window: int
     values: list[float | None]
     timestamps: list[str]
+
+
+class MediaSyncRequest(BaseModel):
+    media_url: str
+    current_audio_sec: float
+    entities: list[str] = []
+
+
+class DecayRequest(BaseModel):
+    values: list[float]
+    decay_type: str = "exponential"
+    params: dict[str, Any] = Field(default_factory=dict)

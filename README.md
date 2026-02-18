@@ -1,3 +1,26 @@
+# Decision Wave Engine (MVP v1.5 Optimizer Merge)
+
+This build merges key ideas from your Grok prompt into the existing MVP **without breaking the current architecture**.
+
+## What was merged from Grok prompt
+- `/analytics/lag_sweep` for lag-based correlation scans
+- `/analytics/correlations/matrix` for heatmap-ready matrix output
+- `/analytics/wave/{entity_id}` series endpoint with SMA(20)
+- `/analytics/media/sync` MP3 overlay integration stub
+- `/status` self-documenting runtime status endpoint
+- Frontend controls for heatmap + MP3 sync stub
+
+## Current capability snapshot
+- Arbitrary metric ingestion (`POST /observations` with `metric_name`, `source_url`, `extra_json`)
+- Repeated graph fetch (`GET /graph/series`)
+- Indicator overlays (`GET /indicators/{sma|ema}`)
+- Pair + Top-N correlations (`/correlations/pair`, `/relationships/top`)
+- Lag sweep + matrix analytics (`/analytics/*`)
+- Email outbox processing (`POST /notifications/outbox/process`)
+- IBKR adapter hooks (`POST /orders/paper`, `POST /orders/live`)
+- Demo seeds including meal/trade scenario (`POST /demo/meal-trade-flow`)
+
+## Setup
 # Decision Wave Engine (MVP v1)
 
 Yes — with current build you can repeatedly fetch and graph **arbitrary metrics** (not only price), run Top-N correlations, apply indicators, trigger notifications, and call IBKR adapter hooks.

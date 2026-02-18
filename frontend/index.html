@@ -16,6 +16,7 @@
       .controls { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
       input, button, select { padding: 8px; border-radius: 6px; border: 1px solid #3a465e; background: #0e1116; color: #fff; }
       .muted { color: #a9b4c6; font-size: 0.9rem; }
+      canvas { width: 100%; max-width: 320px; border: 1px solid #2b3648; border-radius: 6px; }
     </style>
   </head>
   <body>
@@ -31,6 +32,8 @@
         <button onclick="loadWave()">Load Graph</button>
         <button onclick="loadLeaderboard()">Leaderboard</button>
         <button onclick="loadTopN()">Top-N</button>
+        <button onclick="loadHeatMatrix()">Heat Focus Map</button>
+        <button onclick="demoMP3()">MP3 Overlay Stub</button>
       </div>
       <p class="muted">Supports arbitrary metric graphing via metric_name (e.g., price, calories, trade_count).</p>
       <div class="grid">
@@ -40,6 +43,8 @@
           <table id="lb"></table>
           <h3>Top Relationships</h3>
           <table id="topn"></table>
+          <h3>Heat Focus Map</h3>
+          <canvas id="heat" width="320" height="320"></canvas>
         </div>
       </div>
     </div>
@@ -95,6 +100,51 @@
         const rows = await res.json();
         const table = document.getElementById('topn');
         table.innerHTML = '<tr><th>Entity</th><th>Corr</th><th>N</th></tr>' + rows.map(r => `<tr><td>${r.target_entity_name}</td><td>${r.correlation.toFixed(3)}</td><td>${r.points_used}</td></tr>`).join('');
+      }
+
+      async function loadHeatMatrix() {
+        const resEntities = await fetch(`${api}/entities`);
+        if (!resEntities.ok) return;
+        const entities = await resEntities.json();
+        const ids = entities.slice(0, 8).map(e => e.id);
+        if (!ids.length) return;
+
+        const matrixRes = await fetch(`${api}/analytics/correlations/matrix?entity_ids=${ids.join(',')}&metric_name=price`);
+        if (!matrixRes.ok) return;
+        const payload = await matrixRes.json();
+        drawHeat(payload.matrix, ids);
+      }
+
+      function drawHeat(matrix, ids) {
+        const c = document.getElementById('heat');
+        const ctx = c.getContext('2d');
+        ctx.clearRect(0, 0, c.width, c.height);
+
+        const n = ids.length;
+        const cell = Math.max(20, Math.floor(c.width / Math.max(1, n)));
+        ids.forEach((rowId, r) => {
+          ids.forEach((colId, col) => {
+            const v = (matrix?.[String(rowId)]?.[String(colId)] ?? 0);
+            const intensity = Math.min(255, Math.floor(Math.abs(v) * 255));
+            ctx.fillStyle = v >= 0 ? `rgb(0, ${intensity}, 0)` : `rgb(${intensity}, 0, 0)`;
+            ctx.fillRect(col * cell, r * cell, cell - 1, cell - 1);
+          });
+        });
+      }
+
+      async function demoMP3() {
+        const body = {
+          media_url: 'https://example.local/demo.mp3',
+          current_audio_sec: 42.0,
+          entities: ['MEAL-CALORIES', 'TRADES-AFTER-MEAL']
+        };
+        const res = await fetch(`${api}/analytics/media/sync`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body)
+        });
+        const data = await res.json();
+        alert(`MP3 overlay status: ${data.status}`);
       }
 
       loadLeaderboard();
