@@ -1,10 +1,11 @@
 from __future__ import annotations
+from typing import Optional, Union
 
 
-def sma(values: list[float], window: int) -> list[float | None]:
+def sma(values: list[float], window: int) -> list[Optional[float]]:
     if window <= 0:
         raise ValueError("window must be > 0")
-    out: list[float | None] = []
+    out: list[Optional[float]] = []
     for i in range(len(values)):
         if i + 1 < window:
             out.append(None)
@@ -14,12 +15,12 @@ def sma(values: list[float], window: int) -> list[float | None]:
     return out
 
 
-def ema(values: list[float], window: int) -> list[float | None]:
+def ema(values: list[float], window: int) -> list[Optional[float]]:
     if window <= 0:
         raise ValueError("window must be > 0")
-    out: list[float | None] = []
+    out: list[Optional[float]] = []
     k = 2 / (window + 1)
-    running: float | None = None
+    running: Optional[float] = None
     for i, v in enumerate(values):
         if running is None:
             running = v

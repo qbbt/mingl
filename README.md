@@ -71,6 +71,12 @@ pip install -r requirements.txt
 uvicorn app.main:app --reload
 ```
 
+## ⚖️ Repo Governance
+- **Environment Isolation:** This project requires a dedicated virtual environment. 
+- **Tool Preference:** Use the provided configuration files (`requirements.txt`, `environment.yml`, or `pyproject.toml`) as the primary source for setup.
+- **Agent Permission:** You are a "Guest" in this environment. You may read everything, but you must request a 'Permission to Modify' (PTM) before changing any installed dependency or global variable.
+- **Self-Documentation:** Whenever you make a major structural change to the logic, update `CHANGELOG.md` and ensure the README instructions still align with the current setup. If they conflict, flag it to the user immediately.
+
 Open:
 - http://127.0.0.1:8000/
 - http://127.0.0.1:8000/docs

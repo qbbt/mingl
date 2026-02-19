@@ -1,153 +1,412 @@
 <!doctype html>
 <html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Decision Wave MVP</title>
-    <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
-    <style>
-      body { font-family: Arial, sans-serif; margin: 0; background: #0e1116; color: #f0f3f8; }
-      .wrap { padding: 16px; }
-      .grid { display: grid; gap: 12px; grid-template-columns: 2fr 1fr; }
-      .card { background: #171c24; border: 1px solid #283244; border-radius: 8px; padding: 12px; }
-      #wave { height: 430px; }
-      table { width: 100%; border-collapse: collapse; }
-      td, th { border-bottom: 1px solid #2b3648; padding: 8px; text-align: left; }
-      .controls { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
-      input, button, select { padding: 8px; border-radius: 6px; border: 1px solid #3a465e; background: #0e1116; color: #fff; }
-      .muted { color: #a9b4c6; font-size: 0.9rem; }
-      canvas { width: 100%; max-width: 320px; border: 1px solid #2b3648; border-radius: 6px; }
-    </style>
-  </head>
-  <body>
-    <div class="wrap">
-      <h1>Decision Wave MVP</h1>
-      <div class="controls">
-        <input id="entityId" type="number" value="1" min="1" title="Entity ID" />
-        <input id="metricName" type="text" value="price" title="Metric name" />
-        <select id="indicatorName"><option value="sma">SMA</option><option value="ema">EMA</option></select>
-        <input id="windowSize" type="number" value="10" min="1" max="200" title="Indicator window" />
-        <button onclick="seedDemo()">Seed Market Demo</button>
-        <button onclick="seedMealTrade()">Seed Meal↔Trade Demo</button>
-        <button onclick="loadWave()">Load Graph</button>
-        <button onclick="loadLeaderboard()">Leaderboard</button>
-        <button onclick="loadTopN()">Top-N</button>
-        <button onclick="loadHeatMatrix()">Heat Focus Map</button>
-        <button onclick="demoMP3()">MP3 Overlay Stub</button>
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Decision Wave MVP</title>
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      margin: 0;
+      background: #0e1116;
+      color: #f0f3f8;
+    }
+
+    .wrap {
+      padding: 16px;
+      max-width: 1200px;
+      margin: 0 auto;
+    }
+
+    .grid {
+      display: grid;
+      gap: 12px;
+      grid-template-columns: 2fr 1fr;
+    }
+
+    .card {
+      background: #171c24;
+      border: 1px solid #283244;
+      border-radius: 8px;
+      padding: 12px;
+      margin-bottom: 12px;
+    }
+
+    #wave {
+      height: 430px;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 8px;
+    }
+
+    td,
+    th {
+      border-bottom: 1px solid #2b3648;
+      padding: 8px;
+      text-align: left;
+    }
+
+    .controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 10px;
+      padding: 12px;
+      background: #1e2530;
+      border-radius: 8px;
+      border: 1px solid #2b3648;
+    }
+
+    .form-section {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      padding: 12px;
+      background: #1e2530;
+      border-radius: 8px;
+      border: 1px solid #2b3648;
+      margin-bottom: 15px;
+    }
+
+    .input-group {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .input-group label {
+      font-size: 0.8rem;
+      color: #a9b4c6;
+      font-weight: bold;
+    }
+
+    input,
+    button,
+    select {
+      padding: 8px;
+      border-radius: 6px;
+      border: 1px solid #3a465e;
+      background: #0e1116;
+      color: #fff;
+      transition: all 0.2s ease;
+      cursor: pointer;
+    }
+
+    button {
+      background: #3a465e;
+      font-weight: bold;
+      border: none;
+    }
+
+    button:hover {
+      background: #4a5a78;
+      transform: translateY(-1px);
+    }
+
+    button:active {
+      background: #1a2332;
+      transform: translateY(0);
+    }
+
+    .btn-primary {
+      background: #2563eb;
+    }
+
+    .btn-primary:hover {
+      background: #3b82f6;
+    }
+
+    .btn-success {
+      background: #059669;
+    }
+
+    .btn-success:hover {
+      background: #10b981;
+    }
+
+    .muted {
+      color: #a9b4c6;
+      font-size: 0.9rem;
+    }
+
+    canvas {
+      width: 100%;
+      max-width: 320px;
+      border: 1px solid #2b3648;
+      border-radius: 6px;
+    }
+  </style>
+</head>
+
+<body>
+  <div class="wrap">
+    <h1>Decision Wave MVP</h1>
+    <div class="form-section">
+      <div class="input-group">
+        <label>New Entity Name</label>
+        <input id="newEntityName" type="text" placeholder="e.g. BTC-USD" />
       </div>
-      <p class="muted">Supports arbitrary metric graphing via metric_name (e.g., price, calories, trade_count).</p>
-      <div class="grid">
-        <div class="card"><div id="wave"></div></div>
-        <div class="card">
-          <h3>Leaderboard</h3>
-          <table id="lb"></table>
-          <h3>Top Relationships</h3>
-          <table id="topn"></table>
-          <h3>Heat Focus Map</h3>
-          <canvas id="heat" width="320" height="320"></canvas>
-        </div>
+      <div class="input-group">
+        <label>Type</label>
+        <input id="newEntityType" type="text" value="generic" />
+      </div>
+      <div class="input-group" style="justify-content: flex-end;">
+        <button class="btn-primary" onclick="createEntity()">Create Entity</button>
+      </div>
+      <div style="width: 100%; border-top: 1px solid #2b3648; margin: 5px 0;"></div>
+      <div class="input-group">
+        <label>Lookup Entity (Ticker Search)</label>
+        <input id="entityLookup" list="entityList" placeholder="Search by name..." onchange="syncEntityId(this.value)">
+        <datalist id="entityList"></datalist>
+      </div>
+      <div class="input-group">
+        <label>Target Entity ID</label>
+        <input id="obsEntityId" type="number" placeholder="ID" />
+      </div>
+      <div class="input-group">
+        <label>Metric Name</label>
+        <input id="obsMetricName" type="text" value="value" />
+      </div>
+      <div class="input-group">
+        <label>Value</label>
+        <input id="obsValue" type="number" step="any" placeholder="0.0" />
+      </div>
+      <div class="input-group" style="justify-content: flex-end;">
+        <button class="btn-success" onclick="addObservation()">Add Data Point</button>
       </div>
     </div>
-    <script>
-      const api = window.location.origin;
 
-      async function seedDemo() {
-        await fetch(`${api}/demo/seed`, { method: 'POST' });
-        await loadLeaderboard();
-      }
+    <div class="controls">
+      <div class="input-group">
+        <label>Selected ID</label>
+        <input id="entityId" type="number" value="1" min="1" />
+      </div>
+      <div class="input-group">
+        <label>Metrics (comma separated for overlay)</label>
+        <input id="metricName" type="text" value="price" />
+      </div>
+      <div class="input-group">
+        <label>Indicator</label>
+        <select id="indicatorName">
+          <option value="sma">SMA</option>
+          <option value="ema">EMA</option>
+        </select>
+      </div>
+      <div class="input-group">
+        <label>Window</label>
+        <input id="windowSize" type="number" value="10" min="1" max="200" />
+      </div>
+      <div style="display: flex; align-items: flex-end; gap: 8px;">
+        <button onclick="seedDemo()">Market Seed</button>
+        <button onclick="seedMealTrade()">Meal Seed</button>
+        <button onclick="loadWave()" class="btn-primary">Load Graph</button>
+        <button onclick="loadLeaderboard()">Refresh LB</button>
+        <button onclick="loadTopN()">Top-N</button>
+        <button onclick="loadHeatMatrix()">Heatmap</button>
+      </div>
+    </div>
+    <p class="muted">Supports arbitrary metric graphing via metric_name (e.g., price, calories, trade_count).</p>
+    <div class="grid">
+      <div class="card">
+        <div id="wave"></div>
+      </div>
+      <div class="card">
+        <h3>Leaderboard</h3>
+        <table id="lb"></table>
+        <h3>Top Relationships</h3>
+        <table id="topn"></table>
+        <h3>Heat Focus Map</h3>
+        <canvas id="heat" width="320" height="320"></canvas>
+      </div>
+    </div>
+  </div>
+  <script>
+    const api = window.location.origin;
 
-      async function seedMealTrade() {
-        const res = await fetch(`${api}/demo/meal-trade-flow`, { method: 'POST' });
+    async function seedDemo() {
+      await fetch(`${api}/demo/seed`, { method: 'POST' });
+      await loadLeaderboard();
+    }
+
+    async function seedMealTrade() {
+      const res = await fetch(`${api}/demo/meal-trade-flow`, { method: 'POST' });
+      const data = await res.json();
+      document.getElementById('entityId').value = data.meal_entity_id;
+      document.getElementById('obsEntityId').value = data.meal_entity_id;
+    }
+
+    async function createEntity() {
+      const name = document.getElementById('newEntityName').value;
+      const type = document.getElementById('newEntityType').value;
+      if (!name) return alert('Name required');
+
+      const res = await fetch(`${api}/entities`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, entity_type: type })
+      });
+
+      if (res.ok) {
         const data = await res.json();
-        document.getElementById('entityId').value = data.meal_entity_id;
+        document.getElementById('entityId').value = data.id;
+        document.getElementById('obsEntityId').value = data.id;
+        alert(`Created Entity ${name} with ID ${data.id}`);
+        loadLeaderboard();
+      } else {
+        alert('Failed to create entity');
       }
+    }
 
-      async function loadWave() {
-        const id = document.getElementById('entityId').value;
-        const metric = document.getElementById('metricName').value;
-        const indicator = document.getElementById('indicatorName').value;
-        const windowSize = document.getElementById('windowSize').value;
+    async function addObservation() {
+      const id = document.getElementById('obsEntityId').value;
+      const metric = document.getElementById('obsMetricName').value;
+      const value = document.getElementById('obsValue').value;
+      if (!id || !value) return alert('ID and Value required');
 
-        const graphRes = await fetch(`${api}/graph/series?entity_id=${id}&metric_name=${encodeURIComponent(metric)}&limit=500`);
-        if (!graphRes.ok) return;
+      const res = await fetch(`${api}/observations`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          entity_id: parseInt(id),
+          metric_name: metric,
+          value: parseFloat(value),
+          timestamp: new Date().toISOString()
+        })
+      });
+
+      if (res.ok) {
+        document.getElementById('entityId').value = id;
+        document.getElementById('metricName').value = metric;
+        loadWave();
+      } else {
+        alert('Failed to add observation');
+      }
+    }
+
+    let globalEntities = [];
+    async function updateEntityList() {
+      const res = await fetch(`${api}/entities`);
+      if (res.ok) {
+        globalEntities = await res.json();
+        const dl = document.getElementById('entityList');
+        dl.innerHTML = globalEntities.map(e => `<option value="${e.name}"> (ID: ${e.id})</option>`).join('');
+      }
+    }
+
+    function syncEntityId(name) {
+      const ent = globalEntities.find(e => e.name === name);
+      if (ent) {
+        document.getElementById('entityId').value = ent.id;
+        document.getElementById('obsEntityId').value = ent.id;
+      }
+    }
+
+    async function loadWave() {
+      const id = document.getElementById('entityId').value;
+      const metrics = document.getElementById('metricName').value.split(',').map(m => m.trim()).filter(m => m);
+      const indicator = document.getElementById('indicatorName').value;
+      const windowSize = document.getElementById('windowSize').value;
+
+      const traces = [];
+      for (const metric of metrics) {
+        const graphRes = await fetch(`${api}/market/series?entity_id=${id}&metric_name=${encodeURIComponent(metric)}&limit=500`);
+        if (!graphRes.ok) continue;
         const points = await graphRes.json();
 
-        const indRes = await fetch(`${api}/indicators/${indicator}?entity_id=${id}&metric_name=${encodeURIComponent(metric)}&window=${windowSize}&limit=500`);
-        const ind = indRes.ok ? await indRes.json() : { timestamps: [], values: [] };
-
-        const xs = points.map(p => p.timestamp);
-        const ys = points.map(p => p.value);
-        const links = points.map(p => p.source_url || '');
-
-        Plotly.newPlot('wave', [
-          { x: xs, y: ys, mode: 'lines+markers', name: metric, text: links, hovertemplate: 't=%{x}<br>v=%{y}<br>src=%{text}<extra></extra>' },
-          { x: ind.timestamps, y: ind.values, mode: 'lines', name: `${indicator.toUpperCase()}(${windowSize})` }
-        ], { paper_bgcolor: '#171c24', plot_bgcolor: '#171c24', font: {color: '#f0f3f8'}, margin: {t: 30, r: 10, b: 40, l: 40} });
+        traces.push({
+          x: points.map(p => p.timestamp),
+          y: points.map(p => p.value),
+          mode: 'lines+markers',
+          name: metric,
+          text: points.map(p => p.source_url || ''),
+          hovertemplate: 't=%{x}<br>v=%{y}<br>src=%{text}<extra></extra>'
+        });
       }
 
-      async function loadLeaderboard() {
-        const res = await fetch(`${api}/leaderboard`);
-        if (!res.ok) return;
-        const rows = await res.json();
-        const table = document.getElementById('lb');
-        table.innerHTML = '<tr><th>Entity</th><th>Score</th></tr>' + rows.map(r => `<tr><td>${r.entity_name}</td><td>${r.score.toFixed(2)}</td></tr>`).join('');
-      }
-
-      async function loadTopN() {
-        const id = document.getElementById('entityId').value;
-        const res = await fetch(`${api}/relationships/top?entity_id=${id}&top_n=5&lookback_points=120`);
-        if (!res.ok) return;
-        const rows = await res.json();
-        const table = document.getElementById('topn');
-        table.innerHTML = '<tr><th>Entity</th><th>Corr</th><th>N</th></tr>' + rows.map(r => `<tr><td>${r.target_entity_name}</td><td>${r.correlation.toFixed(3)}</td><td>${r.points_used}</td></tr>`).join('');
-      }
-
-      async function loadHeatMatrix() {
-        const resEntities = await fetch(`${api}/entities`);
-        if (!resEntities.ok) return;
-        const entities = await resEntities.json();
-        const ids = entities.slice(0, 8).map(e => e.id);
-        if (!ids.length) return;
-
-        const matrixRes = await fetch(`${api}/analytics/correlations/matrix?entity_ids=${ids.join(',')}&metric_name=price`);
-        if (!matrixRes.ok) return;
-        const payload = await matrixRes.json();
-        drawHeat(payload.matrix, ids);
-      }
-
-      function drawHeat(matrix, ids) {
-        const c = document.getElementById('heat');
-        const ctx = c.getContext('2d');
-        ctx.clearRect(0, 0, c.width, c.height);
-
-        const n = ids.length;
-        const cell = Math.max(20, Math.floor(c.width / Math.max(1, n)));
-        ids.forEach((rowId, r) => {
-          ids.forEach((colId, col) => {
-            const v = (matrix?.[String(rowId)]?.[String(colId)] ?? 0);
-            const intensity = Math.min(255, Math.floor(Math.abs(v) * 255));
-            ctx.fillStyle = v >= 0 ? `rgb(0, ${intensity}, 0)` : `rgb(${intensity}, 0, 0)`;
-            ctx.fillRect(col * cell, r * cell, cell - 1, cell - 1);
+      // Add indicator for the first selected metric
+      if (metrics.length > 0) {
+        const m = metrics[0];
+        const indRes = await fetch(`${api}/indicators/${indicator}?entity_id=${id}&metric_name=${encodeURIComponent(m)}&window=${windowSize}&limit=500`);
+        if (indRes.ok) {
+          const ind = await indRes.json();
+          traces.push({
+            x: ind.timestamps,
+            y: ind.values,
+            mode: 'lines',
+            name: `${indicator.toUpperCase()}(${m}, ${windowSize})`,
+            line: { dash: 'dot', width: 2 }
           });
-        });
+        }
       }
 
-      async function demoMP3() {
-        const body = {
-          media_url: 'https://example.local/demo.mp3',
-          current_audio_sec: 42.0,
-          entities: ['MEAL-CALORIES', 'TRADES-AFTER-MEAL']
-        };
-        const res = await fetch(`${api}/analytics/media/sync`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(body)
-        });
-        const data = await res.json();
-        alert(`MP3 overlay status: ${data.status}`);
-      }
+      Plotly.newPlot('wave', traces, {
+        paper_bgcolor: '#171c24',
+        plot_bgcolor: '#171c24',
+        font: { color: '#f0f3f8' },
+        margin: { t: 30, r: 10, b: 40, l: 40 },
+        legend: { orientation: 'h', y: -0.2 }
+      });
+    }
 
+    async function loadLeaderboard() {
+      const res = await fetch(`${api}/leaderboard`);
+      if (!res.ok) return;
+      const rows = await res.json();
+      const table = document.getElementById('lb');
+      table.innerHTML = '<tr><th>Entity</th><th>Score</th></tr>' + rows.map(r => `<tr><td>${r.entity_name}</td><td>${r.score.toFixed(2)}</td></tr>`).join('');
+    }
+
+    async function loadTopN() {
+      const id = document.getElementById('entityId').value;
+      const res = await fetch(`${api}/relationships/top?entity_id=${id}&top_n=5&lookback_points=120`);
+      if (!res.ok) return;
+      const rows = await res.json();
+      const table = document.getElementById('topn');
+      table.innerHTML = '<tr><th>Entity</th><th>Corr</th><th>N</th></tr>' + rows.map(r => `<tr><td>${r.target_entity_name}</td><td>${r.correlation.toFixed(3)}</td><td>${r.points_used}</td></tr>`).join('');
+    }
+
+    async function loadHeatMatrix() {
+      const resEntities = await fetch(`${api}/entities`);
+      if (!resEntities.ok) return;
+      const entities = await resEntities.json();
+      const ids = entities.slice(0, 8).map(e => e.id);
+      if (!ids.length) return;
+
+      const matrixRes = await fetch(`${api}/analytics/correlations/matrix?entity_ids=${ids.join(',')}&metric_name=price`);
+      if (!matrixRes.ok) return;
+      const payload = await matrixRes.json();
+      drawHeat(payload.matrix, ids);
+    }
+
+    function drawHeat(matrix, ids) {
+      const c = document.getElementById('heat');
+      const ctx = c.getContext('2d');
+      ctx.clearRect(0, 0, c.width, c.height);
+
+      const n = ids.length;
+      const cell = Math.max(20, Math.floor(c.width / Math.max(1, n)));
+      ids.forEach((rowId, r) => {
+        ids.forEach((colId, col) => {
+          const v = (matrix?.[String(rowId)]?.[String(colId)] ?? 0);
+          const intensity = Math.min(255, Math.floor(Math.abs(v) * 255));
+          ctx.fillStyle = v >= 0 ? `rgb(0, ${intensity}, 0)` : `rgb(${intensity}, 0, 0)`;
+          ctx.fillRect(col * cell, r * cell, cell - 1, cell - 1);
+        });
+      });
+    }
+
+    async function waitAndInit() {
+      await updateEntityList();
       loadLeaderboard();
-    </script>
-  </body>
+    }
+
+    waitAndInit();
+  </script>
+</body>
+
 </html>

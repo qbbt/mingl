@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Optional, Union
 
 from pydantic import BaseModel, Field
 
@@ -108,7 +108,7 @@ class IndicatorResult(BaseModel):
     entity_id: int
     metric_name: str
     window: int
-    values: list[float | None]
+    values: list[Optional[float]]
     timestamps: list[str]
 
 

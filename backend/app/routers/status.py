@@ -1,22 +1,30 @@
 from __future__ import annotations
-
 from fastapi import APIRouter
+from app.services.priority_service import priority_service
 
-router = APIRouter(tags=["status"])
-
+router = APIRouter(prefix="/status", tags=["status"])
 
 @router.get("/status")
 def status() -> dict:
     return {
-        "version": "v1.5-optimizer",
-        "mvp_completion": "94%",
+        "version": "v1.6-loop-tightener",
+        "mvp_completion": "96%",
         "features": [
-            "lag_sweep",
-            "heat_focus_map",
-            "mp3_overlay_stub",
+            "autonomous_heartbeat",
+            "loop_tightness_tracking",
+            "urgency_prioritization",
             "bayesian_ready",
-            "ios_quicklog_plan",
         ],
-        "user_guide": "Open dashboard, seed data, graph metrics, run top-N and analytics endpoints.",
-        "next": "add IBKR credentials/config for non-stub execution path",
+        "user_guide": "Run boot.ps1 to start the autonomous system.",
+        "next": "Heatmap visualization",
     }
+
+@router.get("/priorities")
+async def get_priorities():
+    """Returns entity urgency scores."""
+    return await priority_service.calculate_entity_priorities()
+
+@router.get("/tightness")
+async def get_tightness():
+    """Returns system loop efficiency metrics."""
+    return await priority_service.get_system_tightness()

@@ -61,18 +61,21 @@ app.add_middleware(
 runtime_profile = DEFAULT_PROFILE
 broker = IbkrStubAdapter()
 
-if FRONTEND_DIR.exists():
-    app.mount("/frontend", StaticFiles(directory=str(FRONTEND_DIR)), name="frontend")
+from .routers.analytics import router as analytics_router
+from .routers.status import router as status_router
+from .routers.health import router as health_router
+from .routers.market import router as market_router
+from .routers.alignment import router as alignment_router
 
+# ... existing app init ...
 
-@app.on_event("startup")
-def startup() -> None:
-    init_db()
+app.include_router(analytics_router)
+app.include_router(status_router)
+app.include_router(health_router)
+app.include_router(market_router)
+app.include_router(alignment_router)
 
-
-@app.get("/health")
-def health() -> dict:
-    return {"status": "ok", "time": datetime.utcnow().isoformat()}
+# ... static files and startup ...
 
 
 @app.get("/")
@@ -111,41 +114,10 @@ def list_entities() -> list[EntityOut]:
         ]
 
 
-@app.post("/observations")
-def create_observation(payload: ObservationCreate) -> dict:
-    with get_session() as session:
-        entity = session.get(EntityModel, payload.entity_id)
-        if not entity:
-            raise HTTPException(status_code=404, detail="Entity not found")
-        session.add(ObservationModel(**payload.model_dump()))
-        return {"status": "ok"}
+# ... entities listed above ...
 
-
-@app.get("/graph/series", response_model=list[GraphSeriesPoint])
-def graph_series(
-    entity_id: int,
-    metric_name: str = "value",
-    limit: int = Query(default=500, le=5000),
-) -> list[GraphSeriesPoint]:
-    with get_session() as session:
-        rows = session.scalars(
-            select(ObservationModel)
-            .where(ObservationModel.entity_id == entity_id)
-            .where(ObservationModel.metric_name == metric_name)
-            .order_by(ObservationModel.timestamp.asc())
-            .limit(limit)
-        ).all()
-        return [
-            GraphSeriesPoint(
-                timestamp=r.timestamp.isoformat(),
-                value=r.value,
-                metric_name=r.metric_name,
-                source_url=r.source_url,
-                extra_json=r.extra_json or {},
-            )
-            for r in rows
-        ]
-
+# Legacy Observation routes removed (Moved to /market router)
+# Legacy Graph routes removed (Moved to /market router)
 
 @app.get("/indicators/{indicator_name}", response_model=IndicatorResult)
 def indicator_series(
@@ -432,7 +404,8 @@ def live_order(order: OrderRequest) -> dict:
 
 
 @app.post("/demo/seed")
-def seed_demo_data() -> dict:
+async def seed_demo_data() -> dict:
+    from .repositories.data_repository import data_repo
     with get_session() as session:
         names = ["BTC-USD", "ETH-USD", "SOL-USD"]
         ids: list[int] = []
@@ -450,16 +423,16 @@ def seed_demo_data() -> dict:
                 t = now - timedelta(minutes=59 - i)
                 base = 50000 + idx * 2000
                 value = base + ((i - 30) * (20 + idx * 5))
-                session.add(
-                    ObservationModel(
-                        entity_id=entity.id,
-                        timestamp=t,
-                        value=value,
-                        metric_name="price",
-                        margin_of_error=10,
-                        event_type="tick",
-                    )
+                # Push to DuckDB instead of SQLite
+                await data_repo.add_observation(
+                    entity_id=entity.id,
+                    timestamp=t,
+                    value=float(value),
+                    metric_name="price",
+                    priority=0.5
                 )
+            
+            # Also seed a prediction in SQLite (Predictions remain in SQLite for now as per schema)
             session.add(
                 PredictionModel(
                     entity_id=entity.id,
@@ -475,7 +448,8 @@ def seed_demo_data() -> dict:
 
 
 @app.post("/demo/meal-trade-flow")
-def seed_meal_trade_flow() -> dict:
+async def seed_meal_trade_flow() -> dict:
+    from .repositories.data_repository import data_repo
     with get_session() as session:
         meal = session.scalar(select(EntityModel).where(EntityModel.name == "MEAL-CALORIES"))
         if not meal:
@@ -496,26 +470,20 @@ def seed_meal_trade_flow() -> dict:
         trades_after = [1, 3, 2, 4, 1, 4]
         for i, (cal, tr) in enumerate(zip(meals, trades_after)):
             t = now - timedelta(hours=(len(meals) - i) * 4)
-            session.add(
-                ObservationModel(
-                    entity_id=meal.id,
-                    timestamp=t,
-                    value=float(cal),
-                    metric_name="calories",
-                    event_type="meal",
-                    source_url=f"https://example.local/meal/{i+1}.jpg",
-                    extra_json={"parser": "mock", "protein_g": 20 + i, "fat_g": 10 + i},
-                )
+            # Push to DuckDB
+            await data_repo.add_observation(
+                entity_id=meal.id,
+                timestamp=t,
+                value=float(cal),
+                metric_name="calories",
+                priority=1.0 # Manual
             )
-            session.add(
-                ObservationModel(
-                    entity_id=trade.id,
-                    timestamp=t + timedelta(minutes=45),
-                    value=float(tr),
-                    metric_name="trade_count",
-                    event_type="trade_activity",
-                    extra_json={"window_minutes": 90},
-                )
+            await data_repo.add_observation(
+                entity_id=trade.id,
+                timestamp=t + timedelta(minutes=45),
+                value=float(tr),
+                metric_name="trade_count",
+                priority=0.5 # System
             )
 
         return {"status": "ok", "meal_entity_id": meal.id, "trade_entity_id": trade.id}
@@ -540,11 +508,14 @@ async def ws_data(websocket: WebSocket) -> None:
 
 
 @app.get("/summary")
-def summary() -> dict:
+async def summary() -> dict:
+    from .repositories.data_repository import data_repo
     with get_session() as session:
         out = defaultdict(int)
         out["entities"] = session.query(EntityModel).count()
-        out["observations"] = session.query(ObservationModel).count()
+        # Count observations from DuckDB
+        obs_count = await data_repo.get_observation_count()
+        out["observations"] = obs_count
         out["predictions"] = session.query(PredictionModel).count()
         out["annotations"] = session.query(AnnotationModel).count()
         out["correlations"] = session.query(CorrelationModel).count()

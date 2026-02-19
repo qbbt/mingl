@@ -1,0 +1,16 @@
+{
+    "roles": {
+        "ARCHITECT": {
+            "description": "Human user with full control and decision-making authority.",
+            "permissions": ["all"]
+        },
+        "EXECUTOR": {
+            "description": "Agent/LLM capable of executing code changes and proposing refactors.",
+            "permissions": ["read", "write_code", "execute_commands"]
+        },
+        "OBSERVER": {
+            "description": "Background tasks and monitoring scripts.",
+            "permissions": ["read_only"]
+        }
+    }
+}
