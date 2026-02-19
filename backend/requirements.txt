@@ -12,3 +12,7 @@ plotly>=5.20.0
 python-multipart>=0.0.9
 python-dotenv>=1.0.1
 ib-insync>=0.9.86
+duckdb>=1.1.0
+pyarrow>=17.0.0
+streamlit>=1.38.0
+zstandard>=0.23.0
