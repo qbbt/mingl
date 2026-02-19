@@ -6,3 +6,8 @@ __pycache__/
 decision_wave.db
 backend/data_store/*.duckdb
 backend/uvicorn.log
+# Ignore all DuckDB database files and temp logs
+*.duckdb
+*.duckdb.wal
+backend/data_store/
+data_store/

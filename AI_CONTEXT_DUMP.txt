@@ -1,0 +1,1114 @@
+
+--- START OF FILE: backend/app/main.py ---
+from __future__ import annotations
+
+from collections import defaultdict
+from datetime import datetime, timedelta
+from pathlib import Path
+
+from fastapi import FastAPI, HTTPException, Query, WebSocket
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from sqlalchemy import select
+
+from .correlations import pearson
+from .db import (
+    AnnotationModel,
+    ContributorMetricModel,
+    CorrelationModel,
+    EntityModel,
+    LeaderboardSnapshotModel,
+    ObservationModel,
+    PredictionModel,
+    get_session,
+    init_db,
+)
+from .execution import IbkrStubAdapter
+from .indicators import INDICATOR_REGISTRY
+from .leaderboard import DEFAULT_PROFILE, RankingProfile, compute_score
+from .notifications import process_email_outbox, queue_email_notification
+from .routers.analytics import router as analytics_router
+from .routers.status import router as status_router
+from .schemas import (
+    AnnotationCreate,
+    CorrelationPairResult,
+    EntityCreate,
+    EntityOut,
+    GraphSeriesPoint,
+    IndicatorResult,
+    LeaderboardRow,
+    ObservationCreate,
+    OrderRequest,
+    PredictionCreate,
+    RankingConfig,
+    TopRelationship,
+    WaveData,
+)
+
+app = FastAPI(title="Decision Wave Engine", version="0.3.0")
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+FRONTEND_DIR = REPO_ROOT / "frontend"
+FRONTEND_INDEX = FRONTEND_DIR / "index.html"
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+runtime_profile = DEFAULT_PROFILE
+broker = IbkrStubAdapter()
+
+from .routers.analytics import router as analytics_router
+from .routers.status import router as status_router
+from .routers.health import router as health_router
+from .routers.market import router as market_router
+from .routers.alignment import router as alignment_router
+
+# ... existing app init ...
+
+app.include_router(analytics_router)
+app.include_router(status_router)
+app.include_router(health_router)
+app.include_router(market_router)
+app.include_router(alignment_router)
+
+# ... static files and startup ...
+
+
+@app.get("/")
+def index() -> FileResponse:
+    if not FRONTEND_INDEX.exists():
+        raise HTTPException(status_code=404, detail="Frontend not found")
+    return FileResponse(FRONTEND_INDEX)
+
+
+@app.post("/entities", response_model=EntityOut)
+def create_entity(payload: EntityCreate) -> EntityOut:
+    with get_session() as session:
+        existing = session.scalar(select(EntityModel).where(EntityModel.name == payload.name))
+        if existing:
+            raise HTTPException(status_code=409, detail="Entity already exists")
+        entity = EntityModel(**payload.model_dump())
+        session.add(entity)
+        session.flush()
+        session.add(ContributorMetricModel(entity_id=entity.id))
+        return EntityOut(id=entity.id, **payload.model_dump())
+
+
+@app.get("/entities", response_model=list[EntityOut])
+def list_entities() -> list[EntityOut]:
+    with get_session() as session:
+        entities = session.scalars(select(EntityModel).order_by(EntityModel.id.asc())).all()
+        return [
+            EntityOut(
+                id=e.id,
+                name=e.name,
+                entity_type=e.entity_type,
+                contributor_type=e.contributor_type,
+                weight=e.weight,
+            )
+            for e in entities
+        ]
+
+
+# ... entities listed above ...
+
+# Legacy Observation routes removed (Moved to /market router)
+# Legacy Graph routes removed (Moved to /market router)
+
+@app.get("/indicators/{indicator_name}", response_model=IndicatorResult)
+def indicator_series(
+    indicator_name: str,
+    entity_id: int,
+    metric_name: str = "value",
+    window: int = Query(default=14, ge=1, le=500),
+    limit: int = Query(default=500, le=5000),
+) -> IndicatorResult:
+    if indicator_name not in INDICATOR_REGISTRY:
+        raise HTTPException(status_code=404, detail="Indicator not found")
+
+    with get_session() as session:
+        rows = session.scalars(
+            select(ObservationModel)
+            .where(ObservationModel.entity_id == entity_id)
+            .where(ObservationModel.metric_name == metric_name)
+            .order_by(ObservationModel.timestamp.asc())
+            .limit(limit)
+        ).all()
+        values = [r.value for r in rows]
+        timestamps = [r.timestamp.isoformat() for r in rows]
+
+    func = INDICATOR_REGISTRY[indicator_name]
+    try:
+        computed = func(values, window)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return IndicatorResult(
+        indicator=indicator_name,
+        entity_id=entity_id,
+        metric_name=metric_name,
+        window=window,
+        values=computed,
+        timestamps=timestamps,
+    )
+
+
+@app.post("/predictions")
+def create_prediction(payload: PredictionCreate) -> dict:
+    with get_session() as session:
+        entity = session.get(EntityModel, payload.entity_id)
+        if not entity:
+            raise HTTPException(status_code=404, detail="Entity not found")
+        pred = PredictionModel(**payload.model_dump())
+        session.add(pred)
+
+        if not (payload.lower_bound <= payload.predicted_value <= payload.upper_bound):
+            queue_email_notification(
+                session,
+                recipient="local-user@example.com",
+                subject=f"Prediction bounds warning for {entity.name}",
+                body="Predicted value is outside provided bounds.",
+            )
+        return {"status": "ok"}
+
+
+@app.post("/annotations")
+def create_annotation(payload: AnnotationCreate) -> dict:
+    with get_session() as session:
+        entity = session.get(EntityModel, payload.entity_id)
+        if not entity:
+            raise HTTPException(status_code=404, detail="Entity not found")
+        session.add(AnnotationModel(**payload.model_dump()))
+        return {"status": "ok"}
+
+
+@app.get("/wave/{entity_id}", response_model=WaveData)
+def wave(entity_id: int) -> WaveData:
+    with get_session() as session:
+        entity = session.get(EntityModel, entity_id)
+        if not entity:
+            raise HTTPException(status_code=404, detail="Entity not found")
+        observations = session.scalars(
+            select(ObservationModel)
+            .where(ObservationModel.entity_id == entity_id)
+            .order_by(ObservationModel.timestamp.asc())
+        ).all()
+        predictions = session.scalars(
+            select(PredictionModel)
+            .where(PredictionModel.entity_id == entity_id)
+            .order_by(PredictionModel.timestamp.asc())
+        ).all()
+        return WaveData(
+            entity_id=entity.id,
+            entity_name=entity.name,
+            observations=[
+                {
+                    "timestamp": o.timestamp.isoformat(),
+                    "value": o.value,
+                    "metric_name": o.metric_name,
+                    "margin_of_error": o.margin_of_error,
+                    "event_type": o.event_type,
+                    "source_url": o.source_url,
+                    "extra_json": o.extra_json or {},
+                }
+                for o in observations
+            ],
+            predictions=[
+                {
+                    "timestamp": p.timestamp.isoformat(),
+                    "predicted_value": p.predicted_value,
+                    "lower_bound": p.lower_bound,
+                    "upper_bound": p.upper_bound,
+                    "confidence": p.confidence,
+                }
+                for p in predictions
+            ],
+        )
+
+
+@app.post("/ranking/profile")
+def set_ranking_profile(payload: RankingConfig) -> dict:
+    global runtime_profile
+    runtime_profile = RankingProfile(**payload.model_dump())
+    return {"status": "ok", "mode": runtime_profile.mode}
+
+
+@app.get("/leaderboard", response_model=list[LeaderboardRow])
+def leaderboard(limit: int = Query(default=20, le=500)) -> list[LeaderboardRow]:
+    with get_session() as session:
+        entities = session.scalars(select(EntityModel)).all()
+        rows: list[LeaderboardRow] = []
+
+        for entity in entities:
+            latest_pred = session.scalar(
+                select(PredictionModel)
+                .where(PredictionModel.entity_id == entity.id)
+                .order_by(PredictionModel.timestamp.desc())
+                .limit(1)
+            )
+            latest_obs = session.scalar(
+                select(ObservationModel)
+                .where(ObservationModel.entity_id == entity.id)
+                .order_by(ObservationModel.timestamp.desc())
+                .limit(1)
+            )
+            metric = session.scalar(select(ContributorMetricModel).where(ContributorMetricModel.entity_id == entity.id))
+
+            expected_value = (latest_pred.predicted_value - latest_obs.value) if latest_pred and latest_obs else 0.0
+            confidence = latest_pred.confidence if latest_pred else 0.0
+            volatility_penalty = abs(latest_pred.upper_bound - latest_pred.lower_bound) if latest_pred else 0.0
+            decay = 0.1
+            attention_cost = 0.1
+            execution_reliability = metric.directional_accuracy if metric else 0.5
+
+            score, components = compute_score(
+                expected_value=expected_value,
+                confidence=confidence,
+                volatility_penalty=volatility_penalty,
+                decay=decay,
+                attention_cost=attention_cost,
+                execution_reliability=execution_reliability,
+                profile=runtime_profile,
+            )
+
+            rows.append(
+                LeaderboardRow(entity_id=entity.id, entity_name=entity.name, score=score, components=components)
+            )
+            session.add(
+                LeaderboardSnapshotModel(
+                    entity_id=entity.id,
+                    score=score,
+                    mode=runtime_profile.mode,
+                    components=components,
+                )
+            )
+
+        rows.sort(key=lambda row: row.score, reverse=True)
+        return rows[:limit]
+
+
+def _pairwise_correlation_values(
+    session,
+    source_entity_id: int,
+    target_entity_id: int,
+    lookback_points: int,
+    lag_points: int = 0,
+) -> tuple[float, int]:
+    source_obs = session.scalars(
+        select(ObservationModel)
+        .where(ObservationModel.entity_id == source_entity_id)
+        .order_by(ObservationModel.timestamp.desc())
+        .limit(lookback_points + abs(lag_points))
+    ).all()
+    target_obs = session.scalars(
+        select(ObservationModel)
+        .where(ObservationModel.entity_id == target_entity_id)
+        .order_by(ObservationModel.timestamp.desc())
+        .limit(lookback_points + abs(lag_points))
+    ).all()
+
+    source_values = [x.value for x in reversed(source_obs)]
+    target_values = [x.value for x in reversed(target_obs)]
+
+    if lag_points > 0:
+        source_values = source_values[:-lag_points] if len(source_values) > lag_points else []
+        target_values = target_values[lag_points:]
+    elif lag_points < 0:
+        shift = abs(lag_points)
+        source_values = source_values[shift:]
+        target_values = target_values[:-shift] if len(target_values) > shift else []
+
+    n = min(len(source_values), len(target_values), lookback_points)
+    if n < 2:
+        return 0.0, n
+    return pearson(source_values[-n:], target_values[-n:]), n
+
+
+@app.get("/correlations/pair", response_model=CorrelationPairResult)
+def correlation_pair(entity_a_id: int, entity_b_id: int, lookback_points: int = 120, lag_points: int = 0) -> CorrelationPairResult:
+    with get_session() as session:
+        corr, n = _pairwise_correlation_values(session, entity_a_id, entity_b_id, lookback_points, lag_points)
+        session.add(
+            CorrelationModel(
+                entity_a_id=entity_a_id,
+                entity_b_id=entity_b_id,
+                correlation_value=corr,
+                confidence=min(1.0, n / max(lookback_points, 1)),
+                window_seconds=0,
+            )
+        )
+        return CorrelationPairResult(
+            entity_a_id=entity_a_id,
+            entity_b_id=entity_b_id,
+            lag_points=lag_points,
+            points_used=n,
+            correlation=corr,
+        )
+
+
+@app.get("/relationships/top", response_model=list[TopRelationship])
+def top_relationships(entity_id: int, top_n: int = 10, lookback_points: int = 120) -> list[TopRelationship]:
+    with get_session() as session:
+        source = session.get(EntityModel, entity_id)
+        if not source:
+            raise HTTPException(status_code=404, detail="Entity not found")
+
+        others = session.scalars(select(EntityModel).where(EntityModel.id != entity_id)).all()
+        rows: list[TopRelationship] = []
+        for target in others:
+            corr, points_used = _pairwise_correlation_values(session, source.id, target.id, lookback_points)
+            rows.append(
+                TopRelationship(
+                    source_entity_id=source.id,
+                    source_entity_name=source.name,
+                    target_entity_id=target.id,
+                    target_entity_name=target.name,
+                    correlation=corr,
+                    points_used=points_used,
+                )
+            )
+            session.add(
+                CorrelationModel(
+                    entity_a_id=source.id,
+                    entity_b_id=target.id,
+                    correlation_value=corr,
+                    confidence=min(1.0, points_used / max(lookback_points, 1)),
+                    window_seconds=0,
+                )
+            )
+
+        rows.sort(key=lambda r: abs(r.correlation), reverse=True)
+        return rows[:top_n]
+
+
+@app.post("/notifications/outbox/process")
+def process_notifications(limit: int = 20) -> dict:
+    with get_session() as session:
+        return process_email_outbox(session, limit=limit)
+
+
+@app.post("/orders/paper")
+def paper_order(order: OrderRequest) -> dict:
+    response = broker.paper_execute(order.model_dump())
+    return response
+
+
+@app.post("/orders/live")
+def live_order(order: OrderRequest) -> dict:
+    response = broker.live_execute(order.model_dump())
+    return response
+
+
+@app.post("/demo/seed")
+async def seed_demo_data() -> dict:
+    from .repositories.data_repository import data_repo
+    with get_session() as session:
+        names = ["BTC-USD", "ETH-USD", "SOL-USD"]
+        ids: list[int] = []
+        for idx, name in enumerate(names):
+            entity = session.scalar(select(EntityModel).where(EntityModel.name == name))
+            if not entity:
+                entity = EntityModel(name=name, entity_type="crypto", contributor_type="api", weight=1.0)
+                session.add(entity)
+                session.flush()
+                session.add(ContributorMetricModel(entity_id=entity.id, directional_accuracy=0.55 + idx * 0.1))
+            ids.append(entity.id)
+
+            now = datetime.utcnow()
+            for i in range(60):
+                t = now - timedelta(minutes=59 - i)
+                base = 50000 + idx * 2000
+                value = base + ((i - 30) * (20 + idx * 5))
+                # Push to DuckDB instead of SQLite
+                await data_repo.add_observation(
+                    entity_id=entity.id,
+                    timestamp=t,
+                    value=float(value),
+                    metric_name="price",
+                    priority=0.5
+                )
+            
+            # Also seed a prediction in SQLite (Predictions remain in SQLite for now as per schema)
+            session.add(
+                PredictionModel(
+                    entity_id=entity.id,
+                    timestamp=now,
+                    predicted_value=base + 200,
+                    lower_bound=base - 150,
+                    upper_bound=base + 350,
+                    confidence=0.72,
+                )
+            )
+
+        return {"status": "ok", "seeded_entities": ids}
+
+
+@app.post("/demo/meal-trade-flow")
+async def seed_meal_trade_flow() -> dict:
+    from .repositories.data_repository import data_repo
+    with get_session() as session:
+        meal = session.scalar(select(EntityModel).where(EntityModel.name == "MEAL-CALORIES"))
+        if not meal:
+            meal = EntityModel(name="MEAL-CALORIES", entity_type="nutrition", contributor_type="manual", weight=1.0)
+            session.add(meal)
+            session.flush()
+            session.add(ContributorMetricModel(entity_id=meal.id, directional_accuracy=0.7))
+
+        trade = session.scalar(select(EntityModel).where(EntityModel.name == "TRADES-AFTER-MEAL"))
+        if not trade:
+            trade = EntityModel(name="TRADES-AFTER-MEAL", entity_type="behavior", contributor_type="system", weight=1.0)
+            session.add(trade)
+            session.flush()
+            session.add(ContributorMetricModel(entity_id=trade.id, directional_accuracy=0.6))
+
+        now = datetime.utcnow()
+        meals = [450, 700, 600, 900, 400, 800]
+        trades_after = [1, 3, 2, 4, 1, 4]
+        for i, (cal, tr) in enumerate(zip(meals, trades_after)):
+            t = now - timedelta(hours=(len(meals) - i) * 4)
+            # Push to DuckDB
+            await data_repo.add_observation(
+                entity_id=meal.id,
+                timestamp=t,
+                value=float(cal),
+                metric_name="calories",
+                priority=1.0 # Manual
+            )
+            await data_repo.add_observation(
+                entity_id=trade.id,
+                timestamp=t + timedelta(minutes=45),
+                value=float(tr),
+                metric_name="trade_count",
+                priority=0.5 # System
+            )
+
+        return {"status": "ok", "meal_entity_id": meal.id, "trade_entity_id": trade.id}
+
+
+@app.websocket("/ws/data")
+async def ws_data(websocket: WebSocket) -> None:
+    await websocket.accept()
+    while True:
+        with get_session() as session:
+            total_entities = session.query(EntityModel).count()
+            total_observations = session.query(ObservationModel).count()
+        await websocket.send_json(
+            {
+                "type": "heartbeat",
+                "timestamp": datetime.utcnow().isoformat(),
+                "entities": total_entities,
+                "observations": total_observations,
+            }
+        )
+        await websocket.receive_text()
+
+
+@app.get("/summary")
+async def summary() -> dict:
+    from .repositories.data_repository import data_repo
+    with get_session() as session:
+        out = defaultdict(int)
+        out["entities"] = session.query(EntityModel).count()
+        # Count observations from DuckDB
+        obs_count = await data_repo.get_observation_count()
+        out["observations"] = obs_count
+        out["predictions"] = session.query(PredictionModel).count()
+        out["annotations"] = session.query(AnnotationModel).count()
+        out["correlations"] = session.query(CorrelationModel).count()
+        return dict(out)
+
+--- END OF FILE: backend/app/main.py ---
+
+--- START OF FILE: backend/app/services/stats_engine.py ---
+import numpy as np
+import pandas as pd
+from typing import List, Dict, Any, Optional
+from datetime import datetime
+from scipy.stats import gumbel_r
+
+class StatsEngine:
+    """
+    Mathematical Core of the Alignment Protocol.
+    Implements Entropy-Weighting, Kalman Filtering, and Bayesian Bootstrapping.
+    """
+    
+    def __init__(self, convergence_threshold: int = 20):
+        self.convergence_threshold = convergence_threshold
+        # Kalman Filter state: [filtered_value, estimation_error]
+        self.kalman_state = [0.0, 1.0] 
+        self.process_variance = 1e-5
+        self.measurement_variance = 0.1
+
+    def filter_user_score(self, raw_score: float) -> float:
+        """1D Kalman Filter to reduce 'Human Noise' in user ratings."""
+        # Prediction
+        p = self.kalman_state[1] + self.process_variance
+        
+        # Update
+        kalman_gain = p / (p + self.measurement_variance)
+        self.kalman_state[0] = self.kalman_state[0] + kalman_gain * (raw_score - self.kalman_state[0])
+        self.kalman_state[1] = (1 - kalman_gain) * p
+        
+        return float(self.kalman_state[0])
+
+    def compute_alignment_objective(self, df: pd.DataFrame) -> Dict[str, Any]:
+        """
+        Computes the entropy-weighted objective.
+        Uses Bayesian Bootstrapping (flat weights) for N < convergence_threshold.
+        """
+        n = len(df)
+        metrics = ['pearson_r', 'knowledge_gain', 'stability_score']
+        
+        if n == 0:
+            return {"objective": 0.5, "weights": {m: 0.33 for m in metrics}, "phase": "Empty"}
+
+        # Normalized inputs [0, 1]
+        X_raw = df[metrics].copy()
+        
+        # Robust Normalization: If range is zero (sparse data), trust raw values or center them
+        x_min = X_raw.min()
+        x_max = X_raw.max()
+        x_range = x_max - x_min
+        
+        # Apply normalization only where there is variance
+        X = (X_raw - x_min) / (x_range + 1e-8)
+        
+        phase = "Cold Start"
+        if n < 5:
+            # Cold Start: Flat weights and trust raw values (don't zero out single data points)
+            weights = np.array([1/3, 1/3, 1/3])
+            X = X_raw # Use raw values [0,1] during cold start
+        elif n < self.convergence_threshold:
+            # Phase: Volatility-Adjusted weighting
+            phase = "Volatility Phase"
+            variances = X.var().values + 1e-8
+            inv_variance = 1.0 / variances
+            weights = inv_variance / inv_variance.sum()
+        else:
+            # Phase: Entropy weighting (Divergence-based)
+            phase = "Entropy Phase"
+            # Ensure X is normalized [0,1] for entropy
+            p = X / (X.sum() + 1e-8)
+            entropy = -np.sum(p * np.log(p + 1e-8), axis=0) / np.log(n)
+            divergence = 1 - entropy
+            weights = divergence / (divergence.sum() + 1e-8)
+
+        # Map weights back to metric names
+        weights_dict = {m: float(w) for m, w in zip(metrics, weights)}
+        
+        # Final Objective (weighted sum of most recent row)
+        latest_values = X.iloc[-1].values
+        objective = np.dot(latest_values, weights)
+        
+        # Ensure JSON compliance: No NaN or Inf
+        obj_val = float(np.nan_to_num(objective, nan=0.5, posinf=1.0, neginf=0.0))
+        
+        return {
+            "objective": obj_val,
+            "weights": weights_dict,
+            "n": n,
+            "phase": phase
+        }
+
+    def compute_commit_risk(self, lines_changed: int, complexity_delta: float, history: List[float]) -> float:
+        """
+        Calculates risk of 'Architectural Drift' or breakage.
+        Uses Gumbel SF if history is sufficient, otherwise Z-score.
+        """
+        disruption = lines_changed * abs(complexity_delta)
+        
+        if len(history) < 20:
+            # Z-score fallback
+            if not history: return 0.1
+            avg = np.mean(history)
+            std = np.std(history) + 1e-8
+            z = (disruption - avg) / std
+            return float(1 / (1 + np.exp(-z))) # Sigmoid of Z
+        
+        # Gumbel Extreme Value audit
+        params = gumbel_r.fit(history)
+        risk = gumbel_r.sf(disruption, *params)
+        return float(risk)
+
+# Singleton instance
+stats_engine = StatsEngine()
+
+--- END OF FILE: backend/app/services/stats_engine.py ---
+
+--- START OF FILE: backend/app/repositories/data_repository.py ---
+import duckdb
+import os
+import asyncio
+from typing import List, Dict, Any, Optional
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
+
+STORAGE_DIR = "data_store"
+DUCKDB_PATH = os.path.join(STORAGE_DIR, "warehouse.duckdb")
+
+class DataRepository:
+    """
+    Tiered Storage Repository for DuckDB.
+    Job: Data retrieval and raw ingestion (Tier 2/3).
+    """
+    def __init__(self):
+        # We use a ThreadPoolExecutor for blocking DuckDB calls
+        self.executor = ThreadPoolExecutor(max_workers=4)
+        # We connect once, but must ensure thread safety if used across threads
+        self.conn = duckdb.connect(DUCKDB_PATH)
+
+    async def _query(self, sql: str, params: List[Any] = None) -> List[Any]:
+        """Runs a blocking DuckDB query in a background thread."""
+        loop = asyncio.get_event_loop()
+        def _exec():
+            return self.conn.execute(sql, params or []).fetchall()
+        return await loop.run_in_executor(self.executor, _exec)
+
+    async def _execute(self, sql: str, params: List[Any] = None):
+        """Runs a blocking DuckDB execution in a background thread."""
+        loop = asyncio.get_event_loop()
+        def _exec():
+            self.conn.execute(sql, params or [])
+        await loop.run_in_executor(self.executor, _exec)
+
+    async def add_observation(self, entity_id: int, metric_name: str, value: float, priority: float = 0.5, timestamp: Optional[datetime] = None):
+        ts = timestamp or datetime.utcnow()
+        sql = "INSERT INTO observations VALUES (?, ?, ?, ?, ?)"
+        await self._execute(sql, [entity_id, ts, metric_name, value, priority])
+
+    async def _init_observations(self):
+        """Initializes the observations table for market and manual data."""
+        sql = """
+        CREATE TABLE IF NOT EXISTS observations (
+            entity_id INTEGER,
+            timestamp TIMESTAMP,
+            metric_name TEXT,
+            value REAL,
+            priority REAL
+        )
+        """
+        await self._execute(sql)
+
+    async def _init_ledger(self):
+        """Initializes the alignment ledger table in DuckDB."""
+        # Ensure observations is also ready
+        await self._init_observations()
+        sql = """
+        CREATE TABLE IF NOT EXISTS alignment_ledger (
+            timestamp TIMESTAMP,
+            commit_id TEXT,
+            agent_score REAL,
+            user_score REAL,
+            filtered_user_score REAL,
+            pearson_r REAL,
+            r_squared REAL,
+            knowledge_gain REAL,
+            commit_risk REAL,
+            aleatoric_uncertainty REAL,
+            technical_debt_score INTEGER,
+            alignment_objective REAL,
+            notes TEXT,
+            PRIMARY KEY (timestamp, commit_id)
+        )
+        """
+        await self._execute(sql)
+
+    async def add_ledger_entry(self, entry: Dict[str, Any]):
+        sql = """
+        INSERT INTO alignment_ledger VALUES (
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        )
+        """
+        params = [
+            entry.get("timestamp", datetime.utcnow()),
+            entry.get("commit_id", "manual"),
+            entry.get("agent_score", 0.0),
+            entry.get("user_score", 0.0),
+            entry.get("filtered_user_score", 0.0),
+            entry.get("pearson_r", 0.0),
+            entry.get("r_squared", 0.0),
+            entry.get("knowledge_gain", 0.0),
+            entry.get("commit_risk", 0.0),
+            entry.get("aleatoric_uncertainty", 0.0),
+            entry.get("technical_debt_score", 0),
+            entry.get("alignment_objective", 0.0),
+            entry.get("notes", "")
+        ]
+        await self._execute(sql, params)
+
+    async def get_ledger_history(self, limit: int = 100) -> List[Dict[str, Any]]:
+        sql = "SELECT * FROM alignment_ledger ORDER BY timestamp DESC LIMIT ?"
+        rows = await self._query(sql, [limit])
+        return [
+            {
+                "timestamp": r[0].isoformat(),
+                "commit_id": r[1],
+                "agent_score": r[2],
+                "user_score": r[3],
+                "filtered_user_score": r[4],
+                "pearson_r": r[5],
+                "r_squared": r[6],
+                "knowledge_gain": r[7],
+                "commit_risk": r[8],
+                "aleatoric_uncertainty": r[9],
+                "technical_debt_score": r[10],
+                "alignment_objective": r[11],
+                "notes": r[12]
+            } for r in rows
+        ]
+
+    async def get_layered_data(self, entity_id: int, metric_name: str, limit: int = 500) -> List[Dict]:
+        query = """
+            SELECT 
+                COALESCE(u.timestamp, m.timestamp) as ts,
+                COALESCE(u.value, m.value) as val,
+                COALESCE(u.metric_name, m.metric_name) as m_name
+            FROM (SELECT * FROM observations WHERE entity_id = ? AND metric_name = ? AND priority < 1.0) m
+            FULL OUTER JOIN (SELECT * FROM observations WHERE entity_id = ? AND metric_name = ? AND priority >= 1.0) u
+            ON m.timestamp = u.timestamp
+            ORDER BY ts DESC
+            LIMIT ?
+        """
+        rows = await self._query(query, [entity_id, metric_name, entity_id, metric_name, limit])
+        return [
+            {"timestamp": r[0].isoformat(), "value": r[1], "metric_name": r[2]}
+            for r in reversed(rows)
+        ]
+
+    async def get_available_metrics(self, entity_id: int) -> List[str]:
+        """Returns unique metric names for an entity."""
+        query = "SELECT DISTINCT metric_name FROM observations WHERE entity_id = ?"
+        rows = await self._query(query, [entity_id])
+        return [r[0] for r in rows]
+
+    async def get_observation_count(self) -> int:
+        sql = "SELECT COUNT(*) FROM observations"
+        rows = await self._query(sql)
+        return rows[0][0] if rows else 0
+
+    async def check_health(self) -> bool:
+        try:
+            await self._query("SELECT 1")
+            return True
+        except:
+            return False
+
+    async def get_predictions(self, entity_id: int) -> List[Dict]:
+        """Fetch predictions from SQLite warehouse via standard session pattern."""
+        from app.db import get_session, PredictionModel
+        from sqlalchemy import select
+        with get_session() as session:
+            preds = session.scalars(
+                select(PredictionModel)
+                .where(PredictionModel.entity_id == entity_id)
+                .order_by(PredictionModel.timestamp.asc())
+            ).all()
+            return [
+                {
+                    "id": p.id,
+                    "timestamp": p.timestamp.isoformat(),
+                    "value": p.predicted_value,
+                    "lower_bound": p.lower_bound,
+                    "upper_bound": p.upper_bound,
+                    "confidence": p.confidence
+                } for p in preds
+            ]
+
+    async def add_prediction(self, payload: Any):
+        """Persist manual prediction to SQLite."""
+        from app.db import get_session, PredictionModel
+        with get_session() as session:
+            new_pred = PredictionModel(
+                entity_id=payload.entity_id,
+                timestamp=payload.timestamp,
+                predicted_value=payload.predicted_value,
+                lower_bound=payload.lower_bound,
+                upper_bound=payload.upper_bound,
+                confidence=payload.confidence
+            )
+            session.add(new_pred)
+            session.commit()
+
+    async def update_observation(self, entity_id: int, metric_name: str, timestamp: str, new_value: float):
+        """Update a specific observation's value."""
+        sql = """
+        UPDATE observations 
+        SET value = ? 
+        WHERE entity_id = ? AND metric_name = ? AND timestamp = ?
+        """
+        await self._execute(sql, [new_value, entity_id, metric_name, timestamp])
+
+# Singleton instance
+data_repo = DataRepository()
+
+--- END OF FILE: backend/app/repositories/data_repository.py ---
+
+--- START OF FILE: architecture-law.md ---
+# Architecture Law: MINGL-1 Unified Data Manager
+
+## 1. Modularity
+Final code MUST follow the **Repository-Service-Router** pattern.
+- **Repository**: `app/repositories/` (Direct DB access)
+- **Service**: `app/services/` (Business logic, orchestration)
+- **Router**: `app/routers/` (API endpoints, schema validation)
+- **Frontend**: `dashboard.py` (UI only, NO direct DB access)
+
+## 2. Locking Governance (Windows Scale)
+Direct DuckDB access from multiple processes is forbidden on Windows. All data access MUST flow through the FastAPI backend API via the `MarketService`.
+
+## 3. Storage Hierarchy
+- **Tier 1**: In-memory buffer
+- **Tier 2**: DuckDB Warehouse
+- **Tier 3**: Parquet Archive (LZO/ZSTD compressed)
+
+## 4. Redundancy Gate
+Before creating a new repository or service, you MUST check existing files. Integrating with established patterns is mandatory.
+
+--- END OF FILE: architecture-law.md ---
+
+--- START OF FILE: plan.md ---
+# 🗺️ Agentic Roadmap: MINGL "Living" Company
+
+This roadmap tracks the evolution of the MINGL system from a code repository into a self-optimizing "Agentic Workflow" (Agentic Company).
+
+## 🎯 Current Strategic Alignment
+**Alignment Objective**: 0.68 (Bayesian Bootstrap Phase)
+**Goal**: Converge to >0.85 alignment with <0.05 aleatoric variance within 100 commits.
+
+---
+
+## 🚦 Milestone Tracker
+
+### 🔵 Current: Phase 6 - Interactive Performance & Robustness
+- **Status**: `IN_PROGRESS`
+- **Objective**: Establish the human-in-the-loop feedback friction (SUB-1s latency).
+- **Progress**: 
+    - [x] Dashboard Interactive Feedback Form
+    - [x] Real-time Variance (Error) Visualization
+    - [/] API Connectivity Stabilization
+
+### 🟡 Next: Phase 7 - Predictive Resource Allocation (ETA: ~10 Commits)
+- **Status**: `PLANNED`
+- **Goal**: Implement ETAs based on commit frequency and complexity deltas.
+- **Math**: Non-homogeneous Poisson Process (NHPP) for bottleneck detection.
+
+### 🔴 Vision: Phase 8 - Fully Autonomous State Reconciliation
+- **Status**: `CONCEPT`
+- **Goal**: Night Watchman auto-applies non-breaking architectural fixes.
+- **Math**: Reinforcement Learning from Human Feedback (RLHF) loop on `agent_score`.
+
+---
+
+## 📉 Mathematical Performance Targets
+
+| Metric | Baseline | Target | Method |
+| :--- | :--- | :--- | :--- |
+| **User Surprisal (Entropy)** | High | Minimal | Recursive Bayesian Filtering |
+| **System Variance** | 0.30 | <0.05 | Kalman Gain Optimization |
+| **Arch Debt (Entropy)** | 10.0 | <2.0 | AST-based Night Watchman |
+| **Knowledge Acquisition** | Linear | Exponential | Jensen-Shannon Divergence |
+
+---
+
+## 🛠️ Active Fix Plan
+*Current Drift identified by Night Watchman:*
+- `market.py`: Direct DuckDB import (Violation of 3-Layer Cake)
+- `alignment.py`: Direct DuckDB import (Violation of 3-Layer Cake)
+
+**Priority**: High (Fix required to maintain "Scale-First" principles)
+
+--- END OF FILE: plan.md ---
+
+--- START OF FILE: README.md ---
+# Decision Wave Engine (MVP v1.5 Optimizer Merge)
+
+This build merges key ideas from your Grok prompt into the existing MVP **without breaking the current architecture**.
+
+## What was merged from Grok prompt
+- `/analytics/lag_sweep` for lag-based correlation scans
+- `/analytics/correlations/matrix` for heatmap-ready matrix output
+- `/analytics/wave/{entity_id}` series endpoint with SMA(20)
+- `/analytics/media/sync` MP3 overlay integration stub
+- `/status` self-documenting runtime status endpoint
+- Frontend controls for heatmap + MP3 sync stub
+
+## Current capability snapshot
+- Arbitrary metric ingestion (`POST /observations` with `metric_name`, `source_url`, `extra_json`)
+- Repeated graph fetch (`GET /graph/series`)
+- Indicator overlays (`GET /indicators/{sma|ema}`)
+- Pair + Top-N correlations (`/correlations/pair`, `/relationships/top`)
+- Lag sweep + matrix analytics (`/analytics/*`)
+- Email outbox processing (`POST /notifications/outbox/process`)
+- IBKR adapter hooks (`POST /orders/paper`, `POST /orders/live`)
+- Demo seeds including meal/trade scenario (`POST /demo/meal-trade-flow`)
+
+## Setup
+# Decision Wave Engine (MVP v1)
+
+Yes — with current build you can repeatedly fetch and graph **arbitrary metrics** (not only price), run Top-N correlations, apply indicators, trigger notifications, and call IBKR adapter hooks.
+
+
+## Abstract Fundamental Form (Design North Star)
+
+This system is intentionally built around a minimal invariant:
+- entity -> metric stream -> state snapshot -> prediction -> evaluation -> allocation
+
+Everything else (UI, notifications, IBKR integration, plugins) is layered tooling around that core.
+
+See `docs/EVOLUTION_ARCHITECTURE.md` for the feasibility roadmap and phased evolution plan.
+
+## What works now
+- Arbitrary metric ingestion (`metric_name`) via `POST /observations`
+- Repeated graph fetch via `GET /graph/series`
+- Indicator overlays (`sma`, `ema`) via `GET /indicators/{indicator_name}`
+- Pairwise + Top-N correlation endpoints
+- Email outbox queue + SMTP processing endpoint
+- IBKR adapter contract endpoints (`/orders/paper`, `/orders/live`)
+- Dashboard served by backend at `/`
+
+## Current Endpoint Map
+- `GET /` dashboard
+- `GET /docs` swagger docs
+- `POST /entities`, `GET /entities`
+- `POST /observations`
+- `GET /graph/series?entity_id=&metric_name=&limit=`
+- `GET /indicators/{sma|ema}?entity_id=&metric_name=&window=&limit=`
+- `POST /predictions`
+- `GET /leaderboard`
+- `GET /correlations/pair?entity_a_id=&entity_b_id=&lookback_points=&lag_points=`
+- `GET /relationships/top?entity_id=&top_n=&lookback_points=`
+- `POST /notifications/outbox/process?limit=`
+- `POST /orders/paper`, `POST /orders/live`
+- `POST /demo/seed`
+- `POST /demo/meal-trade-flow`
+
+---
+
+## Setup (Running)
+```bash
+cd backend
+python -m venv .venv
+source .venv/bin/activate  # macOS/Linux
+pip install -r requirements.txt
+uvicorn app.main:app --reload
+```
+
+## ⚖️ Repo Governance
+- **Environment Isolation:** This project requires a dedicated virtual environment. 
+- **Tool Preference:** Use the provided configuration files (`requirements.txt`, `environment.yml`, or `pyproject.toml`) as the primary source for setup.
+- **Agent Permission:** You are a "Guest" in this environment. You may read everything, but you must request a 'Permission to Modify' (PTM) before changing any installed dependency or global variable.
+- **Self-Documentation:** Whenever you make a major structural change to the logic, update `CHANGELOG.md` and ensure the README instructions still align with the current setup. If they conflict, flag it to the user immediately.
+
+Open:
+- http://127.0.0.1:8000/
+- http://127.0.0.1:8000/docs
+
+Optional DB override:
+```bash
+export DATABASE_URL='sqlite:///./decision_wave_test.db'
+```
+
+---
+
+## Meal → Trade Example Flow (your scenario)
+
+### 1) Seed the demo meal/trade entities
+```bash
+curl -X POST 'http://127.0.0.1:8000/demo/meal-trade-flow'
+```
+Returns IDs for:
+- `MEAL-CALORIES`
+- `TRADES-AFTER-MEAL`
+
+### 2) Query meal calories graph (time vs calories + source image URL)
+```bash
+curl 'http://127.0.0.1:8000/graph/series?entity_id=<meal_id>&metric_name=calories&limit=200'
+```
+Each point includes:
+- `timestamp`
+- `value`
+- `metric_name`
+- `source_url` (photo link)
+- `extra_json` (parsed nutrition metadata)
+
+### 3) Overlay indicator (example SMA)
+```bash
+curl 'http://127.0.0.1:8000/indicators/sma?entity_id=<meal_id>&metric_name=calories&window=3'
+```
+
+### 4) Correlate meal metric against trade activity
+```bash
+curl 'http://127.0.0.1:8000/correlations/pair?entity_a_id=<meal_id>&entity_b_id=<trade_id>&lookback_points=100&lag_points=1'
+```
+Use `lag_points` to test "trades after meal" offsets.
+
+### 5) Top-N relationships from meal entity
+```bash
+curl 'http://127.0.0.1:8000/relationships/top?entity_id=<meal_id>&top_n=10&lookback_points=200'
+```
+
+---
+
+## Frontend Usage
+On `/` dashboard:
+1. Click **Seed Meal↔Trade Demo** (or Market Demo)
+2. Set `entityId`
+3. Set `metricName` (`calories`, `trade_count`, `price`, etc.)
+4. Click **Load Graph**
+5. Click **Top-N**
+
+Graph supports repeated refresh requests and indicator overlay.
+
+---
+
+## Notifications (Email)
+Set SMTP env vars:
+```bash
+export SMTP_HOST='smtp.example.com'
+export SMTP_PORT='587'
+export SMTP_USERNAME='user'
+export SMTP_PASSWORD='pass'
+export SMTP_USE_TLS='true'
+export EMAIL_FROM='decision-wave@example.com'
+```
+
+Process queued emails:
+```bash
+curl -X POST 'http://127.0.0.1:8000/notifications/outbox/process?limit=20'
+```
+
+---
+
+## IBKR Adapter Hooks
+Current implementation is a safe stub, but stable API contract is in place:
+```bash
+curl -X POST 'http://127.0.0.1:8000/orders/paper' \
+  -H 'Content-Type: application/json' \
+  -d '{"symbol":"AAPL","side":"BUY","quantity":1}'
+```
+
+---
+
+## Tests
+```bash
+cd backend
+pytest -q
+```
+
+- API tests run if FastAPI/SQLAlchemy are available.
+- Core tests validate scoring, correlation, and indicators.
+
+---
+
+## Next engineering target
+- Plug image parser pipeline into `/observations` ingestion path (photo -> nutrition estimate -> point insertion).
+- Replace IBKR stub with real gateway integration.
+- Add user-defined indicator plugin files + registration endpoint.
+
+--- END OF FILE: README.md ---
